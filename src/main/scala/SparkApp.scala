@@ -1,5 +1,6 @@
 
 import org.apache.spark.SparkContext
+import org.apache.spark.mllib.evaluation.{RankingMetrics, RegressionMetrics}
 import org.apache.spark.mllib.recommendation.{ALS, Rating}
 import org.jblas.DoubleMatrix
 
@@ -75,10 +76,10 @@ object SparkApp {
 
     val usersProducts = ratings.map{ case Rating(user, product, rating) => (user, product) }
     val predictions = model.predict(usersProducts).map{
-      case Rating(user, product, rating) => ((user, product), ratings)
+      case Rating(user, product, rating) => ((user, product), rating)
     }
     val ratingsAndPredictions = ratings.map{
-      case Rating(user, product, rating) => ((user, product), ratings)
+      case Rating(user, product, rating) => ((user, product), rating)
     }.join(predictions)
     val MSE = ratingsAndPredictions.map{
       case ((user, product), (actual, predicted)) => math.pow((actual - predicted), 2)
@@ -86,9 +87,69 @@ object SparkApp {
     println("Mean Squared Error = " + MSE)
     val RMSE = math.sqrt(MSE)
     println("Root Mean Squared Error = " + RMSE)
+
+    val predictedAndTrue = ratingsAndPredictions.map{ case ((user, product), (predicted, actual)) => (predicted, actual)}
+    val regressionMetrics = new RegressionMetrics(predictedAndTrue)
+    println("Mean Squared Error = " + regressionMetrics.meanSquaredError)
+    println("Root Mean Squared Error = " + regressionMetrics.rootMeanSquaredError)
+
+
+    // MAPK 整个数据集上的K值平均准确率(Average Precision at K metric, APK)
+    val actualMovices = moviesForUser.map(_.product)
+    val predictedMovices = topKRecs.map(_.product)
+    val apk10 = avgPrecisionK(actualMovices, predictedMovices, 10)
+
+    val itemFactors = model.productFeatures.map{ case (id, factor) => factor }.collect()
+    val itemMatrix = new DoubleMatrix(itemFactors)
+    println(itemMatrix.rows, itemMatrix.columns)
+    val imBroadcast = sc.broadcast(itemMatrix)
+    val allRecs = model.userFeatures.map{ case (userId, array) =>
+        val userVector = new DoubleMatrix(array)
+        val scores = imBroadcast.value.mmul(userVector)
+        val sortedWithId = scores.data.zipWithIndex.sortBy(-_._1)
+        val recommendedIds = sortedWithId.map(_._2 + 1).toSeq
+      (userId, recommendedIds)
+    }
+    val userMovies = ratings.map{ case Rating(user, product, rating) => (user, product) }.groupBy(_._1)
+    var K2 = 10
+    val MAPK = allRecs.join(userMovies).map{ case (useId, (predicted, actualWithIds)) =>
+      val actual = actualWithIds.map(_._2).toSeq
+        avgPrecisionK(actual, predicted, K2)
+    }.reduce(_ + _) / allRecs.count
+    println("Mean Average Precision at K = " + MAPK)
+
+    val predictedAndTrueForRanking = allRecs.join(userMovies).map{ case (userId, (predicted, actualWithIds)) =>
+        val actual = actualWithIds.map(_._2)
+      (predicted.toArray, actual.toArray)
+    }
+    val rankingMetrics = new RankingMetrics(predictedAndTrueForRanking)
+    println("Mean Average Precision = " + rankingMetrics.meanAveragePrecision)
+    K2 = 2000
+    val MAPK2000 = allRecs.join(userMovies).map{ case (useId, (predicted, actualWithIds)) =>
+      val actual = actualWithIds.map(_._2).toSeq
+      avgPrecisionK(actual, predicted, K2)
+    }.reduce(_ + _) / allRecs.count
+    println("Mean Average Precision at K 2000 = " + MAPK2000)
   }
 
   def cosineSimilarity(vec1: DoubleMatrix, vec2: DoubleMatrix): Double = {
     vec1.dot(vec2) / (vec1.norm2() * vec2.norm2())
+  }
+
+  def avgPrecisionK(actual: Seq[Int], predicted: Seq[Int], K: Int): Double = {
+    val predK = predicted.take(K)
+    var score = 0.0
+    var numHits = 0.0
+    for ((p, i) <- predK.zipWithIndex) {
+      if (actual.contains(p)) {
+        numHits += 1.0
+        score += numHits / (i.toDouble + 1.0)
+      }
+    }
+    if (actual.isEmpty) {
+      1.0
+    } else {
+      score / scala.math.min(actual.size, K).toDouble
+    }
   }
 }
